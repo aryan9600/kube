@@ -260,7 +260,7 @@ where
 {
     let (scheduler_shutdown_tx, scheduler_shutdown_rx) = channel::oneshot::channel();
     let (scheduler_tx, scheduler_rx) =
-        channel::mpsc::channel::<ScheduleRequest<ReconcileRequest<K>>>(APPLIER_REQUEUE_BUF_SIZE);
+        channel::mpsc::channel::<ScheduleRequest<ObjectRef<K>>>(APPLIER_REQUEUE_BUF_SIZE);
     let error_policy = Arc::new(error_policy);
     // Create a stream of ObjectRefs that need to be reconciled
     trystream_try_via(
@@ -269,9 +269,14 @@ where
             // 1. inputs from users queue stream
             queue
                 .map_err(Error::QueueError)
-                .map_ok(|request| ScheduleRequest {
-                    message: request.into(),
-                    run_at: Instant::now() + Duration::from_millis(1),
+                .map_ok(|request| {
+                    let r = Into::<ReconcileRequest<K>>::into(request);
+                    let reason = r.reason.to_string();
+                    ScheduleRequest {
+                        message: r.obj_ref,
+                        run_at: Instant::now() + Duration::from_millis(1),
+                        reason: reason,
+                    }
                 })
                 .on_complete(async move {
                     // On error: scheduler has already been shut down and there is nothing for us to do
@@ -288,15 +293,18 @@ where
         move |s| {
             Runner::new(scheduler(s), move |request| {
                 let request = request.clone();
-                match store.get(&request.obj_ref) {
+                let obj_ref = request.0;
+                let reason = request.1;
+                println!("reason: {}", reason);
+                match store.get(&obj_ref) {
                     Some(obj) => {
                         let scheduler_tx = scheduler_tx.clone();
                         let error_policy_ctx = context.clone();
                         let error_policy = error_policy.clone();
                         let reconciler_span = info_span!(
                             "reconciling object",
-                            "object.ref" = %request.obj_ref,
-                            object.reason = %request.reason
+                            "object.ref" = %obj_ref,
+                            object.reason = %reason
                         );
                         reconciler_span
                             .in_scope(|| reconciler(Arc::clone(&obj), context.clone()))
@@ -306,17 +314,17 @@ where
                                 RescheduleReconciliation::new(
                                     res,
                                     |err| error_policy(obj, err, error_policy_ctx),
-                                    request.obj_ref.clone(),
+                                    obj_ref.clone(),
                                     scheduler_tx,
                                 )
                                 // Reconciler errors are OK from the applier's PoV, we need to apply the error policy
                                 // to them separately
-                                .map(|res| Ok((request.obj_ref, res)))
+                                .map(|res| Ok((obj_ref, res)))
                             })
                             .instrument(reconciler_span)
                             .left_future()
                     }
-                    None => future::err(Error::ObjectNotFound(request.obj_ref.erase())).right_future(),
+                    None => future::err(Error::ObjectNotFound(obj_ref.erase())).right_future(),
                 }
             })
             .on_complete(async { tracing::debug!("applier runner terminated") })
@@ -339,9 +347,9 @@ where
 #[pin_project]
 #[must_use]
 struct RescheduleReconciliation<K: Resource, ReconcilerErr> {
-    reschedule_tx: channel::mpsc::Sender<ScheduleRequest<ReconcileRequest<K>>>,
+    reschedule_tx: channel::mpsc::Sender<ScheduleRequest<ObjectRef<K>>>,
 
-    reschedule_request: Option<ScheduleRequest<ReconcileRequest<K>>>,
+    reschedule_request: Option<ScheduleRequest<ObjectRef<K>>>,
     result: Option<Result<Action, ReconcilerErr>>,
 }
 
@@ -353,7 +361,7 @@ where
         result: Result<Action, ReconcilerErr>,
         error_policy: impl FnOnce(&ReconcilerErr) -> Action,
         obj_ref: ObjectRef<K>,
-        reschedule_tx: channel::mpsc::Sender<ScheduleRequest<ReconcileRequest<K>>>,
+        reschedule_tx: channel::mpsc::Sender<ScheduleRequest<ObjectRef<K>>>,
     ) -> Self {
         let reconciler_finished_at = Instant::now();
 
@@ -365,11 +373,9 @@ where
         Self {
             reschedule_tx,
             reschedule_request: action.requeue_after.map(|requeue_after| ScheduleRequest {
-                message: ReconcileRequest {
-                    obj_ref,
-                    reason: reschedule_reason,
-                },
+                message: obj_ref,
                 run_at: reconciler_finished_at + requeue_after,
+                reason: reschedule_reason.to_string(),
             }),
             result: Some(result),
         }

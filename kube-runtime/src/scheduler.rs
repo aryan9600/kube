@@ -2,25 +2,29 @@
 
 use futures::{stream::Fuse, Stream, StreamExt};
 use pin_project::pin_project;
+use crate::controller::ReconcileRequest;
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
     hash::Hash,
     pin::Pin,
-    task::{Context, Poll},
+    task::{Context, Poll}, ops::Deref,
 };
 use tokio::time::Instant;
 use tokio_util::time::delay_queue::{self, DelayQueue};
 
-/// A request to re-emit `message` at a given `Instant` (`run_at`).
+/// A request to re-emit `message` along with the `reason` at a given `Instant` (`run_at`).
 #[derive(Debug)]
 pub struct ScheduleRequest<T> {
     pub message: T,
     pub run_at: Instant,
+    // The reason behind the scheduling of this request.
+    pub reason: String,
 }
 
 /// Internal metadata for a scheduled message.
 struct ScheduledEntry {
     run_at: Instant,
+    reason: String,
     queue_key: delay_queue::Key,
 }
 
@@ -34,7 +38,7 @@ pub struct Scheduler<T, R> {
     /// Metadata for all currently scheduled messages. Used to detect duplicate messages.
     scheduled: HashMap<T, ScheduledEntry>,
     /// Messages that are scheduled to have happened, but have been held using `hold_unless`.
-    pending: HashSet<T>,
+    pending: HashSet<(T, String)>,
     /// Incoming queue of scheduling requests.
     #[pin]
     requests: Fuse<R>,
@@ -56,17 +60,19 @@ impl<'a, T: Hash + Eq + Clone, R> SchedulerProj<'a, T, R> {
     ///
     /// If the message is already in the queue then the earlier `request.run_at` takes precedence.
     fn schedule_message(&mut self, request: ScheduleRequest<T>) {
-        if self.pending.contains(&request.message) {
+        if self.pending.contains(&(request.message.clone(), request.reason.clone())) {
             // Message is already pending, so we can't even expedite it
             return;
         }
-        match self.scheduled.entry(request.message) {
+        match self.scheduled.entry(request.message.clone()) {
             Entry::Occupied(mut old_entry) if old_entry.get().run_at >= request.run_at => {
                 // Old entry will run after the new request, so replace it..
                 let entry = old_entry.get_mut();
+
                 // TODO: this should add a little delay here to actually debounce
                 self.queue.reset_at(&entry.queue_key, request.run_at);
                 entry.run_at = request.run_at;
+                entry.reason = request.reason;
             }
             Entry::Occupied(_old_entry) => {
                 // Old entry will run before the new request, so ignore the new request..
@@ -77,6 +83,7 @@ impl<'a, T: Hash + Eq + Clone, R> SchedulerProj<'a, T, R> {
                 entry.insert(ScheduledEntry {
                     run_at: request.run_at,
                     queue_key: self.queue.insert_at(message, request.run_at),
+                    reason: request.reason,
                 });
             }
         }
@@ -87,8 +94,8 @@ impl<'a, T: Hash + Eq + Clone, R> SchedulerProj<'a, T, R> {
         &mut self,
         cx: &mut Context<'_>,
         can_take_message: impl Fn(&T) -> bool,
-    ) -> Poll<T> {
-        if let Some(msg) = self.pending.iter().find(|msg| can_take_message(*msg)).cloned() {
+    ) -> Poll<(T, String)> {
+        if let Some(msg) = self.pending.iter().find(|msg_with_reason| can_take_message(&msg_with_reason.deref().0)).cloned() {
             return Poll::Ready(self.pending.take(&msg).unwrap());
         }
 
@@ -96,13 +103,13 @@ impl<'a, T: Hash + Eq + Clone, R> SchedulerProj<'a, T, R> {
             match self.queue.poll_expired(cx) {
                 Poll::Ready(Some(msg)) => {
                     let msg = msg.into_inner();
-                    self.scheduled.remove(&msg).expect(
+                    let entry = self.scheduled.remove(&msg).expect(
                         "Expired message was popped from the Scheduler queue, but was not in the metadata map",
                     );
                     if can_take_message(&msg) {
-                        break Poll::Ready(msg);
+                        break Poll::Ready((msg, entry.reason));
                     }
-                    self.pending.insert(msg);
+                    self.pending.insert((msg, entry.reason));
                 }
                 Poll::Ready(None) | Poll::Pending => break Poll::Pending,
             }
@@ -122,7 +129,7 @@ where
     R: Stream<Item = ScheduleRequest<T>>,
     C: Fn(&T) -> bool + Unpin,
 {
-    type Item = T;
+    type Item = (T, String);
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -178,7 +185,7 @@ where
     T: Eq + Hash + Clone,
     R: Stream<Item = ScheduleRequest<T>>,
 {
-    type Item = T;
+    type Item = (T, String);
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.hold_unless(|_| true)).poll_next(cx)

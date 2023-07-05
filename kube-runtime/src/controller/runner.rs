@@ -25,7 +25,7 @@ pub struct Runner<T, R, F, MkF> {
 impl<T, R, F, MkF> Runner<T, R, F, MkF>
 where
     F: Future + Unpin,
-    MkF: FnMut(&T) -> F,
+    MkF: FnMut(&(T, String)) -> F,
 {
     pub fn new(scheduler: Scheduler<T, R>, run_msg: MkF) -> Self {
         Self {
@@ -41,7 +41,7 @@ where
     T: Eq + Hash + Clone + Unpin,
     R: Stream<Item = ScheduleRequest<T>>,
     F: Future + Unpin,
-    MkF: FnMut(&T) -> F,
+    MkF: FnMut(&(T, String)) -> F,
 {
     type Item = F::Output;
 
@@ -63,10 +63,10 @@ where
                 .hold_unless(|msg| !slots.contains_key(msg))
                 .poll_next_unpin(cx);
             match next_msg_poll {
-                Poll::Ready(Some(msg)) => {
-                    let msg_fut = (this.run_msg)(&msg);
+                Poll::Ready(Some(msg_with_reason)) => {
+                    let msg_fut = (this.run_msg)(&msg_with_reason);
                     assert!(
-                        slots.insert(msg, msg_fut).is_none(),
+                        slots.insert(msg_with_reason.0, msg_fut).is_none(),
                         "Runner tried to replace a running future.. please report this as a kube-rs bug!"
                     );
                     cx.waker().wake_by_ref();
